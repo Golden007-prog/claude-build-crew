@@ -1,0 +1,15 @@
+{
+  "name": "build-crew",
+  "description": "build-crew: Claude Code agents that plan, build, review, merge, release and deploy, with code gates for anything that must be true.",
+  "owner": {
+    "name": "Maneesh Jupalle",
+    "url": "https://github.com/ManeeshJupalle"
+  },
+  "plugins": [
+    {
+      "name": "build-crew",
+      "source": "./",
+      "description": "Plan, build, review, merge, release and deploy with agents. Hard checks are code gates."
+    }
+  ]
+}
