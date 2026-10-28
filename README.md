@@ -74,16 +74,16 @@ Rounded boxes are AI, hexagons are code, and the slanted box is you. Each step b
 
 ## The crew
 
-| Agent | Judges (AI) | Can write |
-|---|---|---|
-| `architect` | system shape, decisions, non-goals | `docs/HOW_IT_WORKS.md` |
-| `planner` | phase order and size | `docs/PLAN.md` |
-| `researcher` | which library/service, with live sources | nothing |
-| `debugger` | root cause and the smallest fix | code + regression test |
-| `pr-creator` | commits and PR description | branch, PR |
-| `pr-reviewer` | correctness, security, tests, fit | one PR comment |
-| `release-manager` | release notes | version files, CHANGELOG |
-| `deployer` | deploy method, reading smoke results | nothing (runs the deploy) |
+| Agent | Use it when | Judges (AI) | Can write |
+|---|---|---|---|
+| `architect` | starting a project or a big feature (`/kickoff`) | system shape, decisions, non-goals | `docs/HOW_IT_WORKS.md` |
+| `planner` | right after the architect (`/kickoff`) | phase order and size | `docs/PLAN.md` |
+| `researcher` | before picking a library, API or service (`/research`) | which option, with live sources | nothing |
+| `debugger` | something is broken (`/fix`) | root cause and the smallest fix | code + regression test |
+| `pr-creator` | work is finished locally (`/ship`) | commits and PR description | branch, PR |
+| `pr-reviewer` | a PR needs review before merge (`/ship`) | correctness, security, tests, fit | one PR comment |
+| `release-manager` | cutting a release (`/release`) | release notes | version files, CHANGELOG |
+| `deployer` | shipping to staging, then production (`/deploy`) | deploy method, reading smoke results | nothing (runs the deploy) |
 
 | Gate (code) | Decides |
 |---|---|
@@ -93,7 +93,7 @@ Rounded boxes are AI, hexagons are code, and the slanted box is you. Each step b
 | `merge_gate.py` | may this PR merge, and merges it |
 | `next_version.py` | what the next version is |
 
-See `examples/` for what `HOW_IT_WORKS.md` and `PLAN.md` look like.
+See [examples/HOW_IT_WORKS.md](examples/HOW_IT_WORKS.md) and [examples/PLAN.md](examples/PLAN.md) for what the two planning docs look like.
 
 ## Limits
 
@@ -110,8 +110,6 @@ Gates make the important checks repeatable and visible. They are not a security 
 
 Issues and PRs are welcome, especially new gates, agents, and stack support in `checks.py`. Start with [CONTRIBUTING.md](CONTRIBUTING.md). `pytest -q` runs 160+ tests in about 15 seconds, with no network.
 
-## Acknowledgements
+## License
 
-The "docs for humans to verify, code for agents" principle and the `Code` / `AI` step labels were inspired by the [Equalify Iris how-it-works page](https://iris.equalify.uic.edu/how-it-works).
-
-MIT © Maneesh Jupalle
+MIT © Maneesh Jupalle. See [LICENSE](LICENSE).
