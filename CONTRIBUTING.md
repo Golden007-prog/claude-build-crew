@@ -2,6 +2,10 @@
 
 Thanks for helping! The one rule: **if it must be true, make it code.** Put judgment in agents and guarantees in gates.
 
+## Issues
+- **Bug:** use the Bug template and paste the gate JSON or agent report. It's usually the fastest clue.
+- **Idea:** use the New gate / agent / stack template. If the answer must always be true, it's a gate; if it needs judgment, it's an agent.
+
 ## Setup
 ```bash
 git clone https://github.com/ManeeshJupalle/build-crew && cd build-crew
