@@ -81,6 +81,44 @@ BLOCKED = [
     "git.exe push --force",
     "\"/c/Program Files/Git/cmd/git.exe\" push --force",
     "GH.EXE pr merge 7",
+    # an empty argument must not split the command
+    "git commit -m '' --no-verify",
+    "git push origin \"\" --force",
+    # other shells
+    "fish -c 'git push --force'",
+    "ksh -c 'git reset --hard'",
+    "zsh --command 'git push -f'",
+    "pwsh -c 'git push --force'",
+    "powershell.exe -NoProfile -Command git push --force",
+    "pwsh -NoLogo -com \"gh pr merge 7\"",
+    "pwsh -EncodedCommand ZwBpAHQAIABwAHUAcwBoAA==",
+    "powershell -enc ZwBpAHQA",
+    "powershell \"git push --force\"",
+    "powershell /c \"git push --force\"",
+    "powershell -co \"git push --force\"",
+    "powershell /enc ZwBpAHQA",
+    "powershell -ExecutionPolicy Bypass \"git push --force\"",
+    "pwsh -NoProfile -ep Bypass -Command git push --force",
+    "cmd /c \"git push --force\"",
+    "cmd.exe /C git reset --hard",
+    "cmd //c \"git push --force\"",
+    "cmd /s /c \"git reset --hard\"",
+    # $(...) in the middle of a command
+    "git push origin $(git branch --show-current) --force",
+    "git commit -m $(cat msg.txt) --no-verify",
+    "git reset $(git merge-base HEAD origin/main) --hard",
+    "git push origin $(echo $(whoami)) --force",
+    "git push origin `git branch --show-current` --force",
+    "git reset HEAD~$((1+1)) --hard",
+    "git push origin $(git log -1 --format='%h (x)') --force",
+    "echo '$(' && git push --force && echo ')'",
+    # grouped and control-flow commands
+    "(cd sub && git push --force)",
+    "{ git push --force; }",
+    "npm test || { git reset --hard; }",
+    "if true; then git push --force; fi",
+    "for b in x; do git push -f; done",
+    "! git push --force",
 ]
 
 ALLOWED = [
@@ -112,6 +150,17 @@ ALLOWED = [
     "timeout 120 npm test",
     "git checkout -- src/app.ts",
     "git commit -m 'fix: 修复 naïve — ✓'",
+    "pwsh -c 'git status'",
+    "pwsh -NoProfile -ExecutionPolicy Bypass -File build.ps1",
+    "fish -c 'git push -u origin feat/x'",
+    "pwsh -File deploy.ps1 -e staging",
+    "cmd /c \"git status\"",
+    "cmd //c \"npm test\"",
+    "git push -u origin $(git branch --show-current)",
+    "(cd docs && git status)",
+    "if [ -f x ]; then git push -u origin feat/x; fi",
+    "echo $((1 + 2))",
+    "git commit -m 'fix(guard): handle (cd x && y)'",
 ]
 
 
