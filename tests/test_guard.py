@@ -156,6 +156,9 @@ BLOCKED = [
     "echo 'git push --force' | pwsh -c -",
     "echo 'git push --force' | powershell -",
     "echo 'git push --force' | pwsh -File -",
+    "pwsh -WorkingDirectory /c -Command 'Remove-Item -Recurse -Force ~'",
+    "pwsh -wd /f -c 'git -C D:/repo push --force'",
+    "pwsh -wd /c -enc ZwBpAHQA",
     # fails closed
     "echo $(git status",
 ]
@@ -213,6 +216,8 @@ ALLOWED = [
     "export NODE_ENV=test && npm test",
     "env NODE_ENV=test npm test",
     "cmd /c dir",
+    "pwsh -wd /c/Users/me/repo -c 'git status'",
+    "pwsh -wd /c -c 'git status'",
 ]
 
 # commands from Claude Code's PowerShell tool

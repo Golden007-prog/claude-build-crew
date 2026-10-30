@@ -346,8 +346,11 @@ def check_powershell(args: list[str], state: dict, depth: int) -> str | None:
         if name == "f" or (len(name) > 1 and "file".startswith(name)):
             return stdin if args[k + 1:k + 2] == ["-"] else None
         takes_value = name in PS_VALUE_ALIASES or (len(name) > 1 and any(p.startswith(name) for p in PS_VALUE_PARAMS))
-        # a value never starts with - or /: in pwsh 7, -i is the -Interactive switch, not -InputFormat
-        k += 2 if takes_value and args[k + 1:k + 2] and args[k + 1][:1] not in ("-", "/") else 1
+        if takes_value and args[k + 1:k + 2] and args[k + 1][:1] == "/":
+            # /c can be a value (a Git Bash path: -wd /c) or the next parameter (-Command): check both readings
+            return check_powershell(args[k + 2:], dict(state), depth) or check_powershell(args[k + 1:], state, depth)
+        # a value never starts with -: in pwsh 7, -i is the -Interactive switch, not -InputFormat
+        k += 2 if takes_value and args[k + 1:k + 2] and args[k + 1][:1] != "-" else 1
     if args[k:k + 1] == ["-"]:
         return stdin
     return check(" ".join(args[k:]), depth + 1, state, "powershell") if k < len(args) else None
