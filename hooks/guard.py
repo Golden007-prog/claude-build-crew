@@ -13,11 +13,13 @@ This is a seatbelt, not a sandbox: see "Limits" in the README.
 """
 from __future__ import annotations
 
+import bisect
 import json
 import re
 import shlex
 import subprocess
 import sys
+import time
 
 PROTECTED = re.compile(r"^(main|master|develop|release/.+)$")
 SEPARATORS = {"&&", "||", ";", "|", "&", "\n", "|&", ";;"}
@@ -26,7 +28,11 @@ WRAPPERS = {"sudo", "command", "exec", "time", "nice", "ionice", "nohup", "env",
 WRAPPER_VALUE_FLAGS = {"-u", "-g", "-n", "-s", "-k", "-c", "-p", "-o", "-e", "-i", "--signal", "--kill-after", "--user"}
 HOOK_SKIP_ENV = re.compile(r"^(HUSKY=0|HUSKY_SKIP_HOOKS=|HUSKY_SKIP_INSTALL=|SKIP=|PRE_COMMIT_ALLOW_NO_CONFIG=|GIT_HOOKS_PATH=)")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh"}
-KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!"}  # what follows is a command
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "export"}  # what follows is a command
+PLACEHOLDERS = {c: chr(0xE000 + n) for n, c in enumerate(";&|\n(){}#<")}  # stand-ins for quoted separators
+RESTORE = {ord(v): k for k, v in PLACEHOLDERS.items()}
+COMMENT_START = set(" \t\n;&|()")  # a # right after one of these starts a comment
+SUBST = ""  # stands for a $(...) or `...` substitution, or a PowerShell group, checked on its own
 POWERSHELLS = {"pwsh", "powershell"}
 PS_VALUE_PARAMS = ("executionpolicy", "windowstyle", "inputformat", "outputformat", "version", "psconsolefile",
                    "configurationname", "configurationfile", "workingdirectory", "settingsfile", "custompipename")
@@ -34,14 +40,32 @@ PS_VALUE_ALIASES = {"ep", "ex", "w", "wd", "o", "of", "i", "if", "v"}
 DANGEROUS_RM_TARGETS = {"/", "/*", "~", "~/", "~/*", "$HOME", "${HOME}", "$HOME/", "$HOME/*",
                         ".", "./", "./*", "..", "../", "*", ".*"}
 WINDOWS_ROOTS = re.compile(r"([a-z]:|\$env:(userprofile|home))(/\*?)?", re.I)  # C:\, $env:USERPROFILE\*
+RM_FLAGS = set("dfiIPRrvWx")  # rm's short options, GNU and BSD: with any other letter (-Force), rm fails
 PS_REMOVE = {"remove-item", "ri", "rm", "rmdir", "rd", "del", "erase"}
+PS_SET_ITEM = {"set-item", "si", "set-content", "sc", "new-item", "ni"}
 PS_QUOTES = {"'": "'", "‘": "'", "’": "'", "‚": "'", "‛": "'", '"': '"', "“": '"', "”": '"', "„": '"'}
-PS_HERESTRING = re.compile(r"@(['\"])[ \t]*\r?\n.*?\r?\n\1@", re.S)
-PS_VAR = r"(?:\[[\w.]+\])*\$[\w:.]+"  # $out, $script:x, [string]$x
-SEP, GROUP = object(), object()  # PowerShell tokens: ; | & newline, and ( ) { }
+PS_HERESTRING = re.compile(r"@(['\"])[ \t]*\r?\n")  # opens @'...'@ or @"..."@, which closes at a line starting '@
+# $out, $script:x, ${out}, $x[0], [string[]]$x. No two parts can match the same text, so no slow backtracking
+PS_VAR = r"(?:\[[\w.]+(?:\[[\w.,]*\])*\])*(?:\$\{[^}]+\}|\$[\w:.]+)(?:\[[^\]]*\])*"
+# $x = , $a = $b = , $x, $y = , +=, ??= ... over a command's words joined with NUL
+PS_ASSIGNMENTS = re.compile(rf"(?:{PS_VAR}(?:\0{PS_VAR})*\0?(?:[-+*/%]|\?\?)?=(?!=)\0?)+")
+SEP, PIPE, OPEN, CLOSE = object(), object(), object(), object()  # PowerShell tokens: ; & newline, |, ( {, ) }
+READS_STDIN = "A shell reading its commands from stdin (a pipe, a heredoc or -) can't be verified."
+# Claude Code runs the command if this hook times out (60s), so a command too long or too slow to check is blocked.
+# Slow ones: thousands of git commits or switches, each asking git about branches, or a long chain of pwsh -wd /c,
+# each read both ways
+MAX_COMMAND = 100_000  # characters
+TIME_LIMIT = 10  # seconds
+STARTED = time.monotonic()
+
+
+def check_time() -> None:
+    if time.monotonic() - STARTED > TIME_LIMIT:
+        raise TimeoutError("Checking this command took too long, so it can't be verified.")
 
 
 def current_branch() -> str:
+    check_time()
     try:
         return subprocess.run(["git", "branch", "--show-current"], capture_output=True,
                               text=True, timeout=5).stdout.strip()
@@ -59,6 +83,7 @@ def is_protected_ref(ref: str, branch: str) -> bool:
 
 
 def local_branch_exists(name: str) -> bool:
+    check_time()  # git switch with thousands of names would ask git about each
     try:
         return subprocess.run(["git", "rev-parse", "--verify", "--quiet", f"refs/heads/{name}"],
                               capture_output=True, timeout=5).returncode == 0
@@ -66,12 +91,41 @@ def local_branch_exists(name: str) -> bool:
         return False
 
 
-HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1[^\n]*\n.*?^[ \t]*\2[ \t]*$", re.S | re.M)
+HEREDOC = re.compile(r"<<-?[ \t]*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)(?![A-Za-z0-9_])\1")
 
 
 def strip_heredocs(cmd: str) -> str:
-    """Heredoc bodies are data (commit messages, PR bodies), not commands: drop them."""
-    return HEREDOC.sub(lambda m: m.group(0).split("\n", 1)[0], cmd)
+    """Heredoc bodies are data (commit messages, PR bodies), not commands: drop them, keeping the line each starts on.
+    A heredoc with no closing line is left alone. Each closing line is looked up rather than searched for, since a
+    regex search per heredoc takes quadratic time on a long command, and the hook can't stop a regex at its limit."""
+    closers, pos = {}, 0  # a line's text -> where lines with that text end
+    for line in cmd.split("\n"):
+        pos += len(line)
+        closers.setdefault(line.strip(" \t"), []).append(pos)
+        pos += 1
+    out, i = [], 0
+    for m in HEREDOC.finditer(cmd):
+        body = cmd.find("\n", m.end()) + 1
+        if m.start() < i or not body:
+            continue
+        ends = closers.get(m.group(2), [])
+        k = bisect.bisect_left(ends, body)
+        if k < len(ends):
+            out.append(cmd[i:body - 1])
+            i = ends[k]
+    return "".join(out) + cmd[i:]
+
+
+def ps_herestring(cmd: str, i: int, closers: dict) -> tuple[str, str, int] | None:
+    """The quote, text and end of a here-string opening at i (@'...'@ or @"..."@), or None. Like strip_heredocs(),
+    in linear time: closers holds where the next closing '@ and "@ are, and later here-strings reuse it."""
+    m = PS_HERESTRING.match(cmd, i)
+    if not m:
+        return None
+    q, close = m.group(1), closers.get(m.group(1))
+    if close is None or 0 <= close < m.end() - 1:
+        close = closers[q] = cmd.find("\n" + q + "@", m.end() - 1)
+    return (q, cmd[m.end():close].removesuffix("\r"), close + 3) if close >= 0 else None
 
 
 def prog_name(tok: str) -> str:
@@ -85,30 +139,104 @@ def short_flags(tok: str) -> str:
     return tok[1:] if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1 else ""
 
 
+def closing(cmd: str, i: int) -> int:
+    """Index just past the ) or ` that closes the $( or ` at i, or -1."""
+    if cmd[i] == "`":
+        j = i + 1
+        while j < len(cmd):
+            if cmd[j] == "\\":
+                j += 2
+                continue
+            if cmd[j] == "`":
+                return j + 1
+            j += 1
+        return -1
+    j, depth, quote = i + 2, 1, None
+    while j < len(cmd):
+        c = cmd[j]
+        if c == "\\" and quote != "'":
+            j += 2
+            continue
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c in "()":
+            depth += 1 if c == "(" else -1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+def prescan(cmd: str) -> tuple[str, list[str]]:
+    """shlex returns a quoted ';' the same as a bare one, and splits $(...) into words. So before tokenizing, swap
+    quoted or escaped separators for placeholders, and turn each $(...) and `...` into one word, returning the
+    commands inside to be checked on their own."""
+    out, inner, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if c == "\\" and quote != "'" and i + 1 < len(cmd):
+            nxt = cmd[i + 1]
+            if nxt != "\n":  # backslash-newline continues the line
+                out.append("\\" + PLACEHOLDERS.get(nxt, nxt) if quote else PLACEHOLDERS.get(nxt, "\\" + nxt))
+            i += 2
+        elif quote != "'" and cmd.startswith("$$", i):  # the shell's PID: $$'x' is $$ and then 'x'
+            out.append("$$")
+            i += 2
+        elif quote != "'" and (c == "`" or cmd.startswith("$(", i)):
+            end = closing(cmd, i)
+            if end < 0:
+                raise ValueError("unbalanced substitution")
+            # inside `...`, \` \$ and \\ stand for the plain characters, so `echo \`git push\`` nests
+            inner.append(re.sub(r"\\([`$\\])", r"\1", cmd[i + 1:end - 1]) if c == "`" else cmd[i + 2:end - 1])
+            out.append(SUBST)
+            i = end
+        elif quote is None and cmd.startswith("$'", i):  # $'...' quotes like '...', but \' is a quote inside it
+            j, text = i + 2, []
+            while j < len(cmd) and cmd[j] != "'":
+                j += cmd[j] == "\\"
+                text.append(PLACEHOLDERS.get(cmd[j:j + 1], cmd[j:j + 1]))
+                j += 1
+            if j >= len(cmd):
+                raise ValueError("unbalanced quotes")
+            out.append("'" + "".join(text).replace("'", "'\"'\"'") + "'")
+            i = j + 1
+        elif c == "#" and quote is None and (not out or out[-1] in COMMENT_START):  # a comment runs to the line's end
+            j = cmd.find("\n", i)
+            i = j if j >= 0 else len(cmd)
+        elif c in "'\"" and quote in (None, c):
+            quote = None if quote else c
+            out.append(c)
+            i += 1
+        else:
+            out.append(PLACEHOLDERS[c] if quote and c in PLACEHOLDERS else c)
+            i += 1
+    return "".join(out), inner
+
+
 def tokenize(cmd: str) -> list[str]:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n")
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n()")
     lex.whitespace_split = True
     lex.whitespace = " \t\r"  # keep newlines as separators
-    lex.commenters = ""         # we drop comments per segment, so a comment can't swallow the next line
+    lex.commenters = ""         # prescan() already dropped comments
     return list(lex)
 
 
-def segments(tokens: list[str], braces: bool) -> list[list[str]]:
-    seps = set(";&|\n{}") if braces else set(";&|\n")
-    segs, cur, comment = [], [], False
+def segments(tokens: list[str], braces: bool) -> list[tuple[list[str], bool]]:
+    """Each command, and whether a pipe feeds it."""
+    seps = set(";&|\n(){}") if braces else set(";&|\n()")
+    segs, cur, piped = [], [], False
     for t in tokens:
         if t in SEPARATORS or (t and set(t) <= seps):  # an empty argument ('') is not a separator
             if cur:
-                segs.append(cur)
-            cur, comment = [], False
-        elif comment:
-            continue
-        elif t.startswith("#") and " " not in t:  # a shell comment runs to the end of the line
-            comment = True
+                segs.append((cur, piped))
+            piped = t.count("|") == 1 or (piped and not cur)  # | and |& pipe, || doesn't; x | { bash; } still pipes
+            cur = []
         else:
             cur.append(t)
     if cur:
-        segs.append(cur)
+        segs.append((cur, piped))
     return segs
 
 
@@ -128,6 +256,29 @@ def strip_prefix(seg: list[str]) -> list[str]:
         else:
             break
     return seg[i:]
+
+
+def drop_stdin_redirects(seg: list[str]) -> tuple[list[str], bool]:
+    """Drop <<EOF, < file and <<< text from a command, and say whether it had any. A quoted < is a placeholder."""
+    words, found, k = [], False, 0
+    while k < len(seg):
+        if seg[k][:1] == "<":
+            found = True
+            k += 2 if not seg[k].strip("<-") else 1  # a bare < or <<< takes the next word
+        else:
+            words.append(seg[k])
+            k += 1
+    return words, found
+
+
+def shell_script(args: list[str]) -> str | None:
+    """The script file bash, sh and the like run, or None when they read their commands from stdin (none, or -s)."""
+    k = 0
+    while k < len(args) and args[k][:1] in ("-", "+"):
+        if "s" in short_flags(args[k]):
+            return None
+        k += 2 if args[k] in ("-o", "+o", "-O", "+O", "--rcfile", "--init-file") else 1
+    return args[k] if k < len(args) else None
 
 
 def check_git(args: list[str], state: dict) -> str | None:
@@ -239,7 +390,8 @@ def check_gh(args: list[str]) -> str | None:
 
 
 def check_rm(args: list[str]) -> str | None:
-    recursive = any(a in ("--recursive", "-r", "-R") or set("rR") & set(short_flags(a)) for a in args)
+    recursive = any(a == "--recursive" or set(short_flags(a)) <= RM_FLAGS and set("rR") & set(short_flags(a))
+                    for a in args)
     if not recursive:
         return None
     targets = [a for a in args if not a.startswith("-") or a == "-"]
@@ -266,34 +418,65 @@ def check_remove_item(args: list[str]) -> str | None:
     return None
 
 
-def check_powershell(args: list[str], state: dict, depth: int) -> str | None:
+def ps_param(arg: str) -> str:
+    """What a pwsh / powershell parameter does: encoded, command, file, value (takes one) or switch."""
+    name = arg.lstrip("-/").lower()
+    if name in ("e", "ec") or (len(name) > 1 and "encodedcommand".startswith(name)):
+        return "encoded"
+    if name in ("c", "cwa") or (len(name) > 1 and "commandwithargs".startswith(name)):
+        return "command"
+    if name == "f" or (len(name) > 1 and "file".startswith(name)):
+        return "file"
+    if name in PS_VALUE_ALIASES or (len(name) > 1 and any(p.startswith(name) for p in PS_VALUE_PARAMS)):
+        return "value"
+    return "switch"
+
+
+def check_powershell(args: list[str], state: dict, depth: int, stdin: bool = False) -> str | None:
     """PowerShell runs everything after -Command as one command, and Windows PowerShell does the same with a bare
     first argument. Parameters start with - or /, ignore case and can be shortened (-c, -co, /enc).
-    -EncodedCommand is base64, so it can't be checked. After -File come the script's own arguments."""
+    -EncodedCommand is base64, so it can't be checked. After -File come the script's own arguments.
+    With no command at all, it runs what's piped to it."""
     k = 0
     while k < len(args) and args[k][:1] in ("-", "/"):
-        name = args[k].lstrip("-/").lower()
-        if name in ("e", "ec") or (len(name) > 1 and "encodedcommand".startswith(name)):
+        if args[k] == "-":
+            return READS_STDIN
+        kind = ps_param(args[k])
+        if kind == "encoded":
             return "PowerShell -EncodedCommand can't be verified."
-        if name in ("c", "cwa") or (len(name) > 1 and "commandwithargs".startswith(name)):
+        if kind == "command":
             k += 1
             break
-        if name == "f" or (len(name) > 1 and "file".startswith(name)):
-            return None
-        takes_value = name in PS_VALUE_ALIASES or (len(name) > 1 and any(p.startswith(name) for p in PS_VALUE_PARAMS))
-        k += 2 if takes_value else 1
-    return check(" ".join(args[k:]), depth + 1, state, "powershell") if k < len(args) else None
+        if kind == "file":
+            return READS_STDIN if args[k + 1:k + 2] == ["-"] else None
+        nxt = args[k + 1] if kind == "value" and k + 1 < len(args) else "-"
+        other = ps_param(nxt) if len(nxt) > 1 and nxt[0] in "-/" else ""
+        if other in ("encoded", "command", "file"):
+            # A value that looks like a parameter can be either. /c is a value (a Git Bash path: -wd /c) or -Command,
+            # and -c after -i is -Command in pwsh 7, where -i is the -Interactive switch. So check both readings, and
+            # keep the branch changes of the likelier one
+            reason = check_powershell(args[k + 1:], state if nxt[0] == "-" else dict(state), depth, stdin)
+            if reason:
+                return reason
+            state = dict(state) if nxt[0] == "-" else state
+            k += 2
+            continue
+        # otherwise a value never starts with -: -NoProfile after -ep is a parameter
+        k += 1 if nxt[:1] == "-" else 2
+    if args[k:k + 1] == ["-"]:
+        return READS_STDIN
+    if k < len(args):
+        return check(" ".join(args[k:]), depth + 1, state, "powershell")
+    return READS_STDIN if stdin else None
 
 
-def check_segment(seg: list[str], state: dict, depth: int) -> str | None:
-    if seg and seg[0] == "export":
-        seg = seg[1:]
-    for t in seg:
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
-            break
+def check_segment(seg: list[str], state: dict, depth: int, stdin: bool = False) -> str | None:
+    check_time()
+    rest = strip_prefix(seg)
+    for t in seg[:len(seg) - len(rest)]:  # assignments can follow keywords and wrappers too: env HUSKY=0 git ...
         if HOOK_SKIP_ENV.match(t):
             return f"Skipping git hooks via {t.split('=')[0]} is forbidden."
-    seg = strip_prefix(seg)
+    seg = rest
     if not seg:
         return None
     prog = prog_name(seg[0])
@@ -302,12 +485,15 @@ def check_segment(seg: list[str], state: dict, depth: int) -> str | None:
         for k, a in enumerate(args):
             if (a in ("-c", "--command") or "c" in short_flags(a)) and k + 1 < len(args):
                 return check(args[k + 1], depth + 1, state)
+        if stdin and not shell_script(args):  # echo 'git push --force' | bash, bash <<'EOF'
+            return READS_STDIN
     if prog in POWERSHELLS:
-        return check_powershell(args, state, depth)
+        return check_powershell(args, state, depth, stdin)
     if prog == "cmd":
         for k, a in enumerate(args):
-            if re.fullmatch(r"/+[ckr]", a, re.I):  # Git Bash turns /c into a path, so it's written //c there
-                return check(" ".join(args[k + 1:]), depth + 1, state)
+            m = re.match(r"/+[ckr]", a, re.I)  # Git Bash turns /c into a path, so it's written //c there; /cgit runs too
+            if m:
+                return check(" ".join([a[m.end():], *args[k + 1:]]), depth + 1, state)
     if prog == "eval":
         return check(" ".join(args), depth + 1, state)
     if prog == "git":
@@ -319,17 +505,59 @@ def check_segment(seg: list[str], state: dict, depth: int) -> str | None:
     return None
 
 
-def ps_tokenize(cmd: str) -> list:
-    """PowerShell words, with SEP and GROUP for separators and brackets. Unlike the Bash path, quoting is tracked,
-    so a quoted ';' is a word. Backtick escapes (also inside "..."), '' is a quote inside '...', a backslash is an
-    ordinary character, and a backtick at the end of a line continues it."""
-    out, word, quoted, i = [], [], False, 0
+class Quoted(str):
+    """A PowerShell word that starts with a quote: first in ( ), it makes a value ('--force'), not a command."""
+
+
+def ps_subexpr_end(cmd: str, i: int) -> int:
+    """Index just past the ) that closes the $( at i, or -1. Quotes and backtick escapes inside are skipped."""
+    j, depth = i + 2, 1
+    while j < len(cmd):
+        c = cmd[j]
+        if c == "`":
+            j += 2
+            continue
+        if c in PS_QUOTES:
+            q, j = PS_QUOTES[c], j + 1
+            while j < len(cmd) and PS_QUOTES.get(cmd[j]) != q:
+                j += 2 if q == '"' and cmd[j] == "`" else 1
+        elif c in "()":
+            depth += 1 if c == "(" else -1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+def ps_subexprs(text: str) -> list[str]:
+    """The commands inside each $(...) of an expandable string's text."""
+    found, i = [], 0
+    while i < len(text):
+        if text[i] == "`":
+            i += 2
+        elif text.startswith("$(", i):
+            end = ps_subexpr_end(text, i)
+            if end < 0:
+                raise ValueError("unbalanced subexpression")
+            found.append(text[i + 2:end - 1])
+            i = end
+        else:
+            i += 1
+    return found
+
+
+def ps_tokenize(cmd: str) -> tuple[list, list[str]]:
+    """PowerShell words, with SEP, PIPE, OPEN and CLOSE for separators, pipes and brackets, and the commands inside
+    $(...) in "..." and @"..."@, which run. Unlike the Bash path, quoting is tracked, so a quoted ';' is a word.
+    Backtick escapes (also inside "..."), '' is a quote inside '...', a backslash is an ordinary character, a
+    backtick at the end of a line continues it, and a here-string is one word."""
+    out, inner, word, quoted, lead, i, closers = [], [], [], False, False, 0, {}
 
     def end_word():
-        nonlocal word, quoted
+        nonlocal word, quoted, lead
         if word or quoted:
-            out.append("".join(word))
-        word, quoted = [], False
+            out.append(Quoted("".join(word)) if lead else "".join(word))
+        word, quoted, lead = [], False, False
 
     while i < len(cmd):
         c = cmd[i]
@@ -343,12 +571,27 @@ def ps_tokenize(cmd: str) -> list:
             else:
                 word.append(nxt)
                 i += 2
+        elif c == "@" and (h := ps_herestring(cmd, i, closers)):  # @'...'@ is literal, @"..."@ runs its $(...)
+            lead = lead or not (word or quoted)
+            q, text, i = h
+            word.append(text)
+            quoted = True
+            inner += ps_subexprs(text) if q == '"' else []
         elif c in PS_QUOTES:
+            lead = lead or not (word or quoted)
             q, i, quoted = PS_QUOTES[c], i + 1, True
             while True:
                 if i >= len(cmd):
                     raise ValueError("unbalanced quotes")
                 d = cmd[i]
+                if q == '"' and cmd.startswith("$(", i):  # it runs, and may hold quotes of its own
+                    end = ps_subexpr_end(cmd, i)
+                    if end < 0:
+                        raise ValueError("unbalanced subexpression")
+                    inner.append(cmd[i + 2:end - 1])
+                    word.append(cmd[i:end])
+                    i = end
+                    continue
                 if PS_QUOTES.get(d) == q:
                     if PS_QUOTES.get(cmd[i + 1:i + 2]) == q:  # '' or "" inside the quotes is one quote
                         word.append(d)
@@ -365,6 +608,12 @@ def ps_tokenize(cmd: str) -> list:
         elif c in " \t\r,":
             end_word()
             i += 1
+        elif cmd.startswith("${", i):  # ${out} is one variable, braces and all
+            j = cmd.find("}", i)
+            if j < 0:
+                raise ValueError("unclosed variable")
+            word.append(cmd[i:j + 1])
+            i = j + 1
         elif c == "#" and not word and not quoted:  # a comment runs to the end of the line
             j = cmd.find("\n", i)
             i = j if j >= 0 else len(cmd)
@@ -375,71 +624,110 @@ def ps_tokenize(cmd: str) -> list:
             i = j + 2
         elif c in ";|&\n(){}":
             end_word()
-            out.append(SEP if c in ";|&\n" else GROUP)
+            out.append(SEP if c in ";&\n" else PIPE if c == "|" else OPEN if c in "({" else CLOSE)
             i += 1
         else:
             word.append(c)
             i += 1
     end_word()
-    return out
+    return out, inner
 
 
-def strip_ps_assignment(seg: list[str]) -> list[str]:
-    """`$out = git push --force` still runs git push: drop the variable and the = (also $a = $b = ..., +=)."""
-    while seg:
-        joined = len(seg) > 1 and re.fullmatch(PS_VAR, seg[0])
-        head, rest = (seg[0] + seg[1], seg[2:]) if joined else (seg[0], seg[1:])
-        m = re.fullmatch(PS_VAR + r"[-+*/%]?=(.*)", head, re.S)
-        if not m:
-            return seg
-        seg = ([m.group(1)] if m.group(1) else []) + rest
-    return seg
+def strip_ps_assignment(seg: list[str]) -> tuple[list[str], list[str]]:
+    """`$out = git push --force` still runs git push: split the assigned variables from the command."""
+    text = "\0".join(seg)
+    m = PS_ASSIGNMENTS.match(text)
+    if not m:
+        return [], seg
+    rest = text[m.end():]
+    return re.findall(PS_VAR, m.group(0)), rest.split("\0") if rest else []
 
 
-def check_ps_segment(seg: list[str], state: dict, depth: int) -> str | None:
-    m = re.fullmatch(r"\$env:(\w+)=(.*)", "".join(seg), re.I | re.S)
-    if m and HOOK_SKIP_ENV.match(f"{m.group(1).upper()}={m.group(2)}"):
-        return f"Skipping git hooks via $env:{m.group(1)} is forbidden."
-    seg = strip_ps_assignment(seg)
-    if not seg:
+def check_set_env(args: list[str]) -> str | None:
+    """Set-Item env:HUSKY 0 sets a variable, like $env:HUSKY = 0. The path and value come from -Path (or
+    -LiteralPath) and -Value, also written -Value:0, and otherwise from the first two other arguments."""
+    bound, positional, k = {}, [], 0
+    while k < len(args):
+        a, k = args[k], k + 1
+        name, colon, value = a[1:].partition(":")
+        name = name.lower()
+        if a[:1] != "-" or not name:
+            positional.append(a)
+        elif any(p.startswith(name) for p in ("path", "literalpath", "value")):
+            if not colon:
+                value, k = (args[k] if k < len(args) else ""), k + 1
+            bound["value" if "value".startswith(name) else "path"] = value
+    for slot, value in zip([p for p in ("path", "value") if p not in bound], positional):
+        bound[slot] = value
+    m = re.fullmatch(r"env:[\\/]?(\w+)", bound.get("path", ""), re.I)
+    if m and HOOK_SKIP_ENV.match(f"{m.group(1).upper()}={bound.get('value', '')}"):
+        return f"Skipping git hooks via env:{m.group(1)} is forbidden."
+    return None
+
+
+def check_ps_segment(seg: list[str], state: dict, depth: int, stdin: bool = False) -> str | None:
+    check_time()
+    targets, seg = strip_ps_assignment(seg)
+    for t in targets:  # $env:HUSKY = 0, also as $a = $env:HUSKY = 0
+        m = re.fullmatch(r"\$\{?env:(\w+)\}?", t, re.I)
+        if m and HOOK_SKIP_ENV.match(f"{m.group(1).upper()}={''.join(seg)}"):
+            return f"Skipping git hooks via $env:{m.group(1)} is forbidden."
+    if not seg or re.match(r"[A-Za-z_]\w*=", seg[0]):  # PowerShell has no NAME=value prefix: $x = 'HUSKY=0' is text
         return None
     prog = prog_name(seg[0])
     if prog in PS_REMOVE:
+        args = [a.upper() if a[:1] == "$" else a for a in seg[1:]]  # variable names ignore case: $home is $HOME
         # on Linux and macOS, rm in pwsh is /bin/rm, so check it both ways
-        return check_remove_item(seg[1:]) or (check_rm(seg[1:]) if prog == "rm" else None)
+        return check_remove_item(args) or (check_rm(args) if prog == "rm" else None)
+    if prog in PS_SET_ITEM:
+        return check_set_env(seg[1:])
     if prog in ("iex", "invoke-expression"):
         args = [a for a in seg[1:] if not (len(a) > 1 and a[0] == "-" and "command".startswith(a[1:].lower()))]
         if not args:
             return "Invoke-Expression with piped input can't be verified."
         return check(" ".join(args), depth + 1, state, "powershell")
-    return check_segment(seg, state, depth)
+    return check_segment(seg, state, depth, stdin)
+
+
+def ps_command_word(words: list) -> bool:
+    """Whether a group starting with these words holds a command (Join-Path, git, .\\build.ps1) rather than a value
+    ('x', $x, 1, -not $y)."""
+    return bool(words) and isinstance(words[0], str) and not isinstance(words[0], Quoted) and \
+        bool(re.match(r"[A-Za-z_.\\/]", words[0]))
 
 
 def check_ps(cmd: str, depth: int, state: dict) -> str | None:
-    # $(...) runs even inside "..." and @"..."@ (inside '...' it's checked too, to be safe)
-    for inner in re.findall(r"\$\(([^()]*)\)", cmd):
-        reason = check(inner, depth + 1, state, "powershell")
-        if reason:
-            return reason
     try:
-        tokens = ps_tokenize(PS_HERESTRING.sub("''", cmd))  # here-strings are data, like heredocs
+        tokens, inner = ps_tokenize(cmd)
     except ValueError:
         return "Could not parse this command (unbalanced quotes?), so it can't be verified."
+    for sub in inner:  # $(...) runs even inside "..." and @"..."@
+        reason = check(sub, depth + 1, state, "powershell")
+        if reason:
+            return reason
     # ( ) and { } group commands (if ($?) { git push }) but also wrap arguments (git commit -m (Get-Date) --no-verify),
-    # so check both ways, each from the same starting branch
+    # so check both ways, each from the same starting branch. Read as an argument, a group holding a command,
+    # (Join-Path $HOME x), is one word: its output. A group holding a value, ('--force') or ($HOME), is that value.
     start = dict(state)
     for grouping in (True, False):
         state.clear()
         state.update(start)
-        seg = []
-        for t in tokens + [SEP]:
-            if t is SEP or (t is GROUP and grouping):
-                reason = check_ps_segment(seg, state, depth) if seg else None
+        seg, piped, skip = [], False, 0
+        for n, t in enumerate(tokens + [None]):  # None ends the last command
+            if skip and t is not None:
+                skip += (t is OPEN) - (t is CLOSE)
+            elif not grouping and t is OPEN and ps_command_word(tokens[n + 1:n + 2]):
+                seg.append(SUBST)
+                skip = 1
+            elif not grouping and (t is OPEN or t is CLOSE):
+                continue
+            elif isinstance(t, str):
+                seg.append(t)
+            else:
+                reason = check_ps_segment(seg, state, depth, piped) if seg else None
                 if reason:
                     return reason
-                seg = []
-            elif t is not GROUP:
-                seg.append(t)
+                seg, piped = [], t is PIPE or (piped and not seg)
     return None
 
 
@@ -449,42 +737,44 @@ def check(cmd: str, depth: int = 0, state: dict | None = None, shell: str = "bas
     state = {} if state is None else state
     if shell == "powershell":
         return check_ps(cmd, depth, state)
-    cmd = strip_heredocs(cmd)
-    # commands inside $(...) and backticks run too
-    for inner in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", cmd):
-        reason = check(inner[0] or inner[1], depth + 1, state)
-        if reason:
-            return reason
     try:
+        cmd, inner = prescan(strip_heredocs(cmd))
         tokens = tokenize(cmd)
     except ValueError:
         return "Could not parse this command (unbalanced quotes?), so it can't be verified."
+    for sub in inner:  # commands inside $(...) and backticks run too
+        reason = check(sub, depth + 1, state)
+        if reason:
+            return reason
     # a standalone { } may group commands ({ git push -f; }) or be a plain argument (-m '{}'), so check both ways,
     # each from the same starting branch
     start = dict(state)
     for braces in (False, True):
         state.clear()
         state.update(start)
-        for seg in segments(tokens, braces):
-            reason = check_segment(seg, state, depth)
+        for seg, piped in segments(tokens, braces):
+            seg, redirected = drop_stdin_redirects(seg)
+            reason = check_segment([t.translate(RESTORE) for t in seg], state, depth, piped or redirected)
             if reason:
                 return reason
     return None
 
 
 def main() -> int:
-    try:
+    cmd = ""
+    try:  # Claude Code runs the command on any exit code but 2, so a crash here must block
         data = json.loads(sys.stdin.buffer.read())  # bytes: Claude Code sends UTF-8, Windows would decode as cp1252
-    except Exception:
-        print("BLOCKED by build-crew guard: unreadable hook input.", file=sys.stderr)
-        return 2
-    shell = {"Bash": "bash", "PowerShell": "powershell"}.get(data.get("tool_name"))
-    if not shell:
-        return 0
-    cmd = (data.get("tool_input") or {}).get("command", "")
-    reason = check(cmd, shell=shell)
+        shell = {"Bash": "bash", "PowerShell": "powershell"}.get(data.get("tool_name"))
+        if not shell:
+            return 0
+        cmd = (data.get("tool_input") or {}).get("command", "")
+        reason = "Command too long to verify." if len(cmd) > MAX_COMMAND else check(cmd, shell=shell)
+    except TimeoutError as e:
+        reason = str(e)
+    except Exception as e:
+        reason = f"Could not read or check this command ({type(e).__name__}), so it can't be verified."
     if reason:
-        print(f"BLOCKED by build-crew guard: {reason}\nCommand: {cmd.strip()[:300]}", file=sys.stderr)
+        print(f"BLOCKED by build-crew guard: {reason}\nCommand: {str(cmd).strip()[:300]}", file=sys.stderr)
         return 2
     return 0
 

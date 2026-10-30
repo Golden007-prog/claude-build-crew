@@ -3,6 +3,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 
 import pytest
 
@@ -130,7 +131,61 @@ BLOCKED = [
     "pwsh -c 'npm test; if ($?) { git push --force }'",
     "pwsh -c 'rm -rf ~'",
     "powershell -Command 'rm -rf .'",
+    # assignments after a keyword or wrapper
+    "if x; then HUSKY=0 git commit -m y; fi",
+    "env HUSKY=0 git commit -m y",
+    "sudo HUSKY=0 git commit -m y",
+    "then export HUSKY=0",
+    # a quoted or escaped separator is an argument, not a separator
+    "git commit -m ';' --no-verify",
+    "git commit -m '(' --no-verify",
+    "git commit -m \\; --no-verify",
+    "git commit -m '#1' --no-verify",
+    "git commit -m \"a && b\" --no-verify",
+    "git push \\\n  --force",
+    # subshells, and a substitution as an option's value
+    "(git reset --hard)",
+    "x=1; (cd sub; git push --force)",
+    "git -C $(git rev-parse --show-toplevel) push --force",
+    "git -C `git rev-parse --show-toplevel` push --force",
+    "echo \"$(git push --force)\"",
+    # cmd and PowerShell switches
+    "cmd //cgit push --force",
+    "cmd /cgit reset --hard",
+    "pwsh -i -enc ZwBpAHQA",
+    "echo 'git push --force' | pwsh -Command -",
+    "echo 'git push --force' | pwsh -c -",
+    "echo 'git push --force' | powershell -",
+    "echo 'git push --force' | pwsh -File -",
+    "pwsh -WorkingDirectory /c -Command 'Remove-Item -Recurse -Force ~'",
+    "pwsh -wd /f -c 'git -C D:/repo push --force'",
+    "pwsh -wd /c -enc ZwBpAHQA",
+    "pwsh -wd /c -c 'git switch main' && git commit -m x",
+    # comments end at the line's end, and only start a word
+    "# Let's reset\ngit reset --hard origin/feat/x\n# That's it",
+    "git push origin a#b --force",
+    # a shell running what it reads from stdin
+    "echo 'git push --force' | powershell -NoProfile",
+    "echo 'git push --force' | bash",
+    "echo 'git push --force' | sudo sh -s",
+    "echo 'git push --force' | bash -o pipefail",
+    "bash <<'EOF'\ngit push --force\nEOF",
+    "bash <<< 'git push --force'",
+    "pwsh -NoProfile <<'EOF'\ngit push --force\nEOF",
+    # nested backticks, and $'...' quoting
+    "echo `echo \\`git push --force\\``",
+    "git commit -m $'fix: don\\'t crash' --no-verify",
+    # from the review of #35: $$ is the PID, a carriage return isn't a blank, and every /c reading counts
+    "echo $$'\\'; git push --force; echo '\\'",
+    "git status\r# x; git push --force",
+    "pwsh -wd /c -i /c /usr/bin/git push --force",
+    # a value starting with - can be the next parameter
+    "pwsh -wd -f -c 'git push --force'",
+    "pwsh -ep -File -c 'git push --force'",
 ]
+
+# blocked because they can't be parsed, the only cases allowed to block that way
+UNPARSEABLE = ["echo $(git status"]
 
 ALLOWED = [
     "git push -u origin feat/resume-export",
@@ -176,6 +231,23 @@ ALLOWED = [
     "git commit -m 'feat: x' && git switch main",
     "git push && git checkout main && git pull",
     "powershell -c 'Get-ChildItem \"D:\\\"'",
+    # quoted separators, parentheses and substitutions are text
+    "git commit -m 'feat: a; b (c) #1 && d'",
+    "git commit -m \"fix(guard): x; y\"",
+    "git commit -m 'docs: never run $(git push --force)'",
+    "(cd docs && npm test)",
+    "echo $(( $(date +%s) - 60 ))",
+    "export NODE_ENV=test && npm test",
+    "env NODE_ENV=test npm test",
+    "cmd /c dir",
+    "pwsh -wd /c/Users/me/repo -c 'git status'",
+    "pwsh -wd /c -c 'git status'",
+    "git rebase origin/main  # (then git push --force-with-lease)",
+    "git status # it's fine",
+    "git commit -m $'fix: don\\'t crash'",
+    "cat files.txt | bash scripts/each.sh",
+    "echo hi | pwsh -c 'Write-Output $input'",
+    "pwsh --version",
 ]
 
 # commands from Claude Code's PowerShell tool
@@ -237,10 +309,39 @@ PS_BLOCKED = [
     "[string]$a = $b = git push -f",
     "$log += git push --force",
     "rm -rf ~",
-    # fails closed
-    "git commit -m 'unbalanced",
-    "git push --force`",
+    "'git push --force' | powershell -NoProfile",
+    "Write-Output \"$(if ($x) { git push --force })\"",
+    "iex @'\ngit push --force\n'@",
+    "pwsh -Command @'\ngit push --force\n'@",
+    # variable names ignore case
+    "Remove-Item -Recurse -Force $home",
+    "Remove-Item -Recurse -Force $Home\\*",
+    # environment variables set as items
+    "Set-Item env:HUSKY 0",
+    "si env:HUSKY 0",
+    "Set-Content env:HUSKY 0",
+    "Set-Item -Path Env:\\HUSKY -Value 0",
+    # every form of assignment
+    "[string[]]$x = git push --force",
+    "${out} = git push --force",
+    "$x[0] = git push --force",
+    "$x, $y = git push --force",
+    "$x ??= git push --force",
+    "$a = $env:HUSKY = 0",
+    # from the review of #36: a group holding a value is that value
+    "git push origin ('--force')",
+    "git push $('--force')",
+    "git push @('--force')",
+    "git push origin ('--force', 'x')",
+    "& ('git') push --force",
+    "Remove-Item -Recurse -Force ('~')",
+    "git push origin ('main')",
+    "pwsh -c ('git push --force')",
+    "$env:HUSKY = (0)",
+    "Set-Item env:HUSKY -Value:0",
 ]
+
+PS_UNPARSEABLE = ["git commit -m 'unbalanced", "git push --force`"]
 
 PS_ALLOWED = [
     "git status",
@@ -267,6 +368,24 @@ PS_ALLOWED = [
     "$branch = git branch --show-current",
     "$out = git push -u origin feat/x 2>&1",
     "if ($x -eq 1) { git status }",
+    # a group used as an argument is one word
+    "Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE '.cache\\pip')",
+    "Remove-Item -Recurse -Force (Join-Path . 'build')",
+    "git commit -m (Get-Content msg.txt -Encoding utf8)",
+    # $(...) runs only in expandable strings
+    "gh pr create --title x --body @'\ndocs: $(git push --force) is now blocked\n'@",
+    "git commit -m 'docs: never run $(git push --force)'",
+    "Write-Output \"a $(git log --format=\"%h (x)\") b\"",
+    # PowerShell's rm parameters aren't rm flags
+    "rm -Force *",
+    "rm * -Force",
+    "rm -Force .",
+    "rm -ErrorAction SilentlyContinue *",
+    # PowerShell has no NAME=value prefix
+    "$x = 'HUSKY=0'",
+    "$line = \"SKIP=lint\"",
+    "Set-Item env:NODE_ENV test",
+    "Set-Content -Path notes.txt -Value env:SKIP",
 ]
 
 
@@ -275,9 +394,13 @@ def payload(cmd: str, tool: str = "Bash") -> bytes:
     return json.dumps({"tool_name": tool, "tool_input": {"command": cmd}}, ensure_ascii=False).encode("utf-8")
 
 
-def guard(cmd: str, tool: str = "Bash", cwd=None) -> int:
+def run_guard(cmd: str, tool: str = "Bash", cwd=None) -> subprocess.CompletedProcess:
     return subprocess.run([sys.executable, str(HOOKS / "guard.py")], input=payload(cmd, tool),
-                          capture_output=True, cwd=cwd).returncode
+                          capture_output=True, cwd=cwd)
+
+
+def guard(cmd: str, tool: str = "Bash", cwd=None) -> int:
+    return run_guard(cmd, tool, cwd).returncode
 
 
 @pytest.fixture
@@ -288,7 +411,8 @@ def feature_repo(repo):
 
 @pytest.mark.parametrize("cmd", BLOCKED)
 def test_blocks(cmd, feature_repo):
-    assert guard(cmd, cwd=feature_repo) == 2
+    res = run_guard(cmd, cwd=feature_repo)
+    assert res.returncode == 2 and b"Could not parse" not in res.stderr  # blocked for what it does
 
 
 @pytest.mark.parametrize("cmd", ALLOWED)
@@ -298,12 +422,19 @@ def test_allows(cmd, feature_repo):
 
 @pytest.mark.parametrize("cmd", PS_BLOCKED)
 def test_blocks_powershell(cmd, feature_repo):
-    assert guard(cmd, tool="PowerShell", cwd=feature_repo) == 2
+    res = run_guard(cmd, "PowerShell", feature_repo)
+    assert res.returncode == 2 and b"Could not parse" not in res.stderr
 
 
 @pytest.mark.parametrize("cmd", PS_ALLOWED)
 def test_allows_powershell(cmd, feature_repo):
     assert guard(cmd, tool="PowerShell", cwd=feature_repo) == 0
+
+
+@pytest.mark.parametrize("tool,cmd", [("Bash", c) for c in UNPARSEABLE] + [("PowerShell", c) for c in PS_UNPARSEABLE])
+def test_blocks_what_it_cannot_parse(tool, cmd, feature_repo):
+    res = run_guard(cmd, tool, feature_repo)
+    assert res.returncode == 2 and b"Could not parse" in res.stderr
 
 
 def test_powershell_tracks_branch(repo):
@@ -344,6 +475,33 @@ def test_fails_closed():
     res = subprocess.run([sys.executable, str(HOOKS / "guard.py")], input="not json", text=True, capture_output=True)
     assert res.returncode == 2
     assert guard("git commit -m 'unbalanced") == 2
+
+
+def test_blocks_when_the_check_crashes():
+    # a crash would exit 1, which Claude Code treats as a non-blocking error and runs the command
+    bad = json.dumps({"tool_name": "Bash", "tool_input": {"command": ["git", "push", "--force"]}}).encode()
+    res = subprocess.run([sys.executable, str(HOOKS / "guard.py")], input=bad, capture_output=True)
+    assert res.returncode == 2 and b"Could not read or check this command" in res.stderr
+
+
+def test_blocks_commands_too_long_or_slow_to_check(monkeypatch):
+    # if the hook times out, Claude Code runs the command
+    res = run_guard("git status && " * 10_000)
+    assert res.returncode == 2 and b"too long" in res.stderr
+    for cmd, tool in (("cat <<" + "A" * 99_000, "Bash"), ("cat <<A\n" * 12_000, "Bash"), ("@'\n" * 30_000, "PowerShell"),
+                      ("si" + " env:A" * 16_000 + "; git push --force", "PowerShell")):
+        start = time.monotonic()
+        run_guard(cmd, tool)
+        assert time.monotonic() - start < 10, cmd[:10]  # no regex that rescans the rest of the command
+    monkeypatch.syspath_prepend(str(HOOKS))
+    import guard as g
+    monkeypatch.setattr(g, "STARTED", time.monotonic())
+    assert g.check("git status") is None
+    monkeypatch.setattr(g, "STARTED", time.monotonic() - g.TIME_LIMIT - 1)
+    for slow in (lambda: g.check("git status"), lambda: g.check("rm x", shell="powershell"), g.current_branch,
+                 lambda: g.local_branch_exists("x")):
+        with pytest.raises(TimeoutError):
+            slow()
 
 
 def hook_command() -> str:
