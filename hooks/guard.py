@@ -26,7 +26,10 @@ WRAPPERS = {"sudo", "command", "exec", "time", "nice", "ionice", "nohup", "env",
 WRAPPER_VALUE_FLAGS = {"-u", "-g", "-n", "-s", "-k", "-c", "-p", "-o", "-e", "-i", "--signal", "--kill-after", "--user"}
 HOOK_SKIP_ENV = re.compile(r"^(HUSKY=0|HUSKY_SKIP_HOOKS=|HUSKY_SKIP_INSTALL=|SKIP=|PRE_COMMIT_ALLOW_NO_CONFIG=|GIT_HOOKS_PATH=)")
 SHELLS = {"bash", "sh", "zsh", "dash", "ksh", "mksh", "ash", "fish", "csh", "tcsh"}
-KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!"}  # what follows is a command
+KEYWORDS = {"if", "then", "else", "elif", "do", "while", "until", "!", "export"}  # what follows is a command
+PLACEHOLDERS = {c: chr(0xE000 + n) for n, c in enumerate(";&|\n(){}#")}  # stand-ins for quoted separators
+RESTORE = {ord(v): k for k, v in PLACEHOLDERS.items()}
+SUBST = ""  # stands for a $(...) or `...` substitution, whose command is checked on its own
 POWERSHELLS = {"pwsh", "powershell"}
 PS_VALUE_PARAMS = ("executionpolicy", "windowstyle", "inputformat", "outputformat", "version", "psconsolefile",
                    "configurationname", "configurationfile", "workingdirectory", "settingsfile", "custompipename")
@@ -85,8 +88,67 @@ def short_flags(tok: str) -> str:
     return tok[1:] if tok.startswith("-") and not tok.startswith("--") and len(tok) > 1 else ""
 
 
+def closing(cmd: str, i: int) -> int:
+    """Index just past the ) or ` that closes the $( or ` at i, or -1."""
+    if cmd[i] == "`":
+        j = i + 1
+        while j < len(cmd):
+            if cmd[j] == "\\":
+                j += 2
+                continue
+            if cmd[j] == "`":
+                return j + 1
+            j += 1
+        return -1
+    j, depth, quote = i + 2, 1, None
+    while j < len(cmd):
+        c = cmd[j]
+        if c == "\\" and quote != "'":
+            j += 2
+            continue
+        if quote:
+            quote = None if c == quote else quote
+        elif c in "'\"":
+            quote = c
+        elif c in "()":
+            depth += 1 if c == "(" else -1
+            if depth == 0:
+                return j + 1
+        j += 1
+    return -1
+
+
+def prescan(cmd: str) -> tuple[str, list[str]]:
+    """shlex returns a quoted ';' the same as a bare one, and splits $(...) into words. So before tokenizing, swap
+    quoted or escaped separators for placeholders, and turn each $(...) and `...` into one word, returning the
+    commands inside to be checked on their own."""
+    out, inner, quote, i = [], [], None, 0
+    while i < len(cmd):
+        c = cmd[i]
+        if c == "\\" and quote != "'" and i + 1 < len(cmd):
+            nxt = cmd[i + 1]
+            if nxt != "\n":  # backslash-newline continues the line
+                out.append("\\" + PLACEHOLDERS.get(nxt, nxt) if quote else PLACEHOLDERS.get(nxt, "\\" + nxt))
+            i += 2
+        elif quote != "'" and (c == "`" or cmd.startswith("$(", i)):
+            end = closing(cmd, i)
+            if end < 0:
+                raise ValueError("unbalanced substitution")
+            inner.append(cmd[i + 1 if c == "`" else i + 2:end - 1])
+            out.append(SUBST)
+            i = end
+        elif c in "'\"" and quote in (None, c):
+            quote = None if quote else c
+            out.append(c)
+            i += 1
+        else:
+            out.append(PLACEHOLDERS[c] if quote and c in PLACEHOLDERS else c)
+            i += 1
+    return "".join(out), inner
+
+
 def tokenize(cmd: str) -> list[str]:
-    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n")
+    lex = shlex.shlex(cmd, posix=True, punctuation_chars=";&|\n()")
     lex.whitespace_split = True
     lex.whitespace = " \t\r"  # keep newlines as separators
     lex.commenters = ""         # we drop comments per segment, so a comment can't swallow the next line
@@ -94,7 +156,7 @@ def tokenize(cmd: str) -> list[str]:
 
 
 def segments(tokens: list[str], braces: bool) -> list[list[str]]:
-    seps = set(";&|\n{}") if braces else set(";&|\n")
+    seps = set(";&|\n(){}") if braces else set(";&|\n()")
     segs, cur, comment = [], [], False
     for t in tokens:
         if t in SEPARATORS or (t and set(t) <= seps):  # an empty argument ('') is not a separator
@@ -266,34 +328,56 @@ def check_remove_item(args: list[str]) -> str | None:
     return None
 
 
+def ps_param(arg: str) -> str:
+    """What a pwsh / powershell parameter does: encoded, command, file, value (takes one) or switch."""
+    name = arg.lstrip("-/").lower()
+    if name in ("e", "ec") or (len(name) > 1 and "encodedcommand".startswith(name)):
+        return "encoded"
+    if name in ("c", "cwa") or (len(name) > 1 and "commandwithargs".startswith(name)):
+        return "command"
+    if name == "f" or (len(name) > 1 and "file".startswith(name)):
+        return "file"
+    if name in PS_VALUE_ALIASES or (len(name) > 1 and any(p.startswith(name) for p in PS_VALUE_PARAMS)):
+        return "value"
+    return "switch"
+
+
 def check_powershell(args: list[str], state: dict, depth: int) -> str | None:
     """PowerShell runs everything after -Command as one command, and Windows PowerShell does the same with a bare
     first argument. Parameters start with - or /, ignore case and can be shortened (-c, -co, /enc).
     -EncodedCommand is base64, so it can't be checked. After -File come the script's own arguments."""
+    stdin = "PowerShell reading its command from stdin (-) can't be verified."
     k = 0
     while k < len(args) and args[k][:1] in ("-", "/"):
-        name = args[k].lstrip("-/").lower()
-        if name in ("e", "ec") or (len(name) > 1 and "encodedcommand".startswith(name)):
+        if args[k] == "-":
+            return stdin
+        kind = ps_param(args[k])
+        if kind == "encoded":
             return "PowerShell -EncodedCommand can't be verified."
-        if name in ("c", "cwa") or (len(name) > 1 and "commandwithargs".startswith(name)):
+        if kind == "command":
             k += 1
             break
-        if name == "f" or (len(name) > 1 and "file".startswith(name)):
-            return None
-        takes_value = name in PS_VALUE_ALIASES or (len(name) > 1 and any(p.startswith(name) for p in PS_VALUE_PARAMS))
-        k += 2 if takes_value else 1
+        if kind == "file":
+            return stdin if args[k + 1:k + 2] == ["-"] else None
+        nxt = args[k + 1] if kind == "value" and k + 1 < len(args) else "-"
+        if nxt[:1] == "/" and ps_param(nxt) in ("encoded", "command", "file"):
+            # /c can be a value (a Git Bash path: -wd /c) or the next parameter (-Command): check that reading too
+            reason = check_powershell(args[k + 1:], dict(state), depth)
+            if reason:
+                return reason
+        # a value never starts with -: in pwsh 7, -i is the -Interactive switch, not -InputFormat
+        k += 1 if nxt[:1] == "-" else 2
+    if args[k:k + 1] == ["-"]:
+        return stdin
     return check(" ".join(args[k:]), depth + 1, state, "powershell") if k < len(args) else None
 
 
 def check_segment(seg: list[str], state: dict, depth: int) -> str | None:
-    if seg and seg[0] == "export":
-        seg = seg[1:]
-    for t in seg:
-        if not re.match(r"^[A-Za-z_][A-Za-z0-9_]*=", t):
-            break
+    rest = strip_prefix(seg)
+    for t in seg[:len(seg) - len(rest)]:  # assignments can follow keywords and wrappers too: env HUSKY=0 git ...
         if HOOK_SKIP_ENV.match(t):
             return f"Skipping git hooks via {t.split('=')[0]} is forbidden."
-    seg = strip_prefix(seg)
+    seg = rest
     if not seg:
         return None
     prog = prog_name(seg[0])
@@ -306,8 +390,9 @@ def check_segment(seg: list[str], state: dict, depth: int) -> str | None:
         return check_powershell(args, state, depth)
     if prog == "cmd":
         for k, a in enumerate(args):
-            if re.fullmatch(r"/+[ckr]", a, re.I):  # Git Bash turns /c into a path, so it's written //c there
-                return check(" ".join(args[k + 1:]), depth + 1, state)
+            m = re.match(r"/+[ckr]", a, re.I)  # Git Bash turns /c into a path, so it's written //c there; /cgit runs too
+            if m:
+                return check(" ".join([a[m.end():], *args[k + 1:]]), depth + 1, state)
     if prog == "eval":
         return check(" ".join(args), depth + 1, state)
     if prog == "git":
@@ -449,16 +534,15 @@ def check(cmd: str, depth: int = 0, state: dict | None = None, shell: str = "bas
     state = {} if state is None else state
     if shell == "powershell":
         return check_ps(cmd, depth, state)
-    cmd = strip_heredocs(cmd)
-    # commands inside $(...) and backticks run too
-    for inner in re.findall(r"\$\(([^()]*)\)|`([^`]*)`", cmd):
-        reason = check(inner[0] or inner[1], depth + 1, state)
-        if reason:
-            return reason
     try:
+        cmd, inner = prescan(strip_heredocs(cmd))
         tokens = tokenize(cmd)
     except ValueError:
         return "Could not parse this command (unbalanced quotes?), so it can't be verified."
+    for sub in inner:  # commands inside $(...) and backticks run too
+        reason = check(sub, depth + 1, state)
+        if reason:
+            return reason
     # a standalone { } may group commands ({ git push -f; }) or be a plain argument (-m '{}'), so check both ways,
     # each from the same starting branch
     start = dict(state)
@@ -466,7 +550,7 @@ def check(cmd: str, depth: int = 0, state: dict | None = None, shell: str = "bas
         state.clear()
         state.update(start)
         for seg in segments(tokens, braces):
-            reason = check_segment(seg, state, depth)
+            reason = check_segment([t.translate(RESTORE) for t in seg], state, depth)
             if reason:
                 return reason
     return None
