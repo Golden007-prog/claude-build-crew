@@ -130,6 +130,34 @@ BLOCKED = [
     "pwsh -c 'npm test; if ($?) { git push --force }'",
     "pwsh -c 'rm -rf ~'",
     "powershell -Command 'rm -rf .'",
+    # assignments after a keyword or wrapper
+    "if x; then HUSKY=0 git commit -m y; fi",
+    "env HUSKY=0 git commit -m y",
+    "sudo HUSKY=0 git commit -m y",
+    "then export HUSKY=0",
+    # a quoted or escaped separator is an argument, not a separator
+    "git commit -m ';' --no-verify",
+    "git commit -m '(' --no-verify",
+    "git commit -m \\; --no-verify",
+    "git commit -m '#1' --no-verify",
+    "git commit -m \"a && b\" --no-verify",
+    "git push \\\n  --force",
+    # subshells, and a substitution as an option's value
+    "(git reset --hard)",
+    "x=1; (cd sub; git push --force)",
+    "git -C $(git rev-parse --show-toplevel) push --force",
+    "git -C `git rev-parse --show-toplevel` push --force",
+    "echo \"$(git push --force)\"",
+    # cmd and PowerShell switches
+    "cmd //cgit push --force",
+    "cmd /cgit reset --hard",
+    "pwsh -i -enc ZwBpAHQA",
+    "echo 'git push --force' | pwsh -Command -",
+    "echo 'git push --force' | pwsh -c -",
+    "echo 'git push --force' | powershell -",
+    "echo 'git push --force' | pwsh -File -",
+    # fails closed
+    "echo $(git status",
 ]
 
 ALLOWED = [
@@ -176,6 +204,15 @@ ALLOWED = [
     "git commit -m 'feat: x' && git switch main",
     "git push && git checkout main && git pull",
     "powershell -c 'Get-ChildItem \"D:\\\"'",
+    # quoted separators, parentheses and substitutions are text
+    "git commit -m 'feat: a; b (c) #1 && d'",
+    "git commit -m \"fix(guard): x; y\"",
+    "git commit -m 'docs: never run $(git push --force)'",
+    "(cd docs && npm test)",
+    "echo $(( $(date +%s) - 60 ))",
+    "export NODE_ENV=test && npm test",
+    "env NODE_ENV=test npm test",
+    "cmd /c dir",
 ]
 
 # commands from Claude Code's PowerShell tool
