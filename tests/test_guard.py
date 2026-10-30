@@ -179,6 +179,9 @@ BLOCKED = [
     "echo $$'\\'; git push --force; echo '\\'",
     "git status\r# x; git push --force",
     "pwsh -wd /c -i /c /usr/bin/git push --force",
+    # a value starting with - can be the next parameter
+    "pwsh -wd -f -c 'git push --force'",
+    "pwsh -ep -File -c 'git push --force'",
 ]
 
 # blocked because they can't be parsed, the only cases allowed to block that way
@@ -307,6 +310,35 @@ PS_BLOCKED = [
     "$log += git push --force",
     "rm -rf ~",
     "'git push --force' | powershell -NoProfile",
+    "Write-Output \"$(if ($x) { git push --force })\"",
+    "iex @'\ngit push --force\n'@",
+    "pwsh -Command @'\ngit push --force\n'@",
+    # variable names ignore case
+    "Remove-Item -Recurse -Force $home",
+    "Remove-Item -Recurse -Force $Home\\*",
+    # environment variables set as items
+    "Set-Item env:HUSKY 0",
+    "si env:HUSKY 0",
+    "Set-Content env:HUSKY 0",
+    "Set-Item -Path Env:\\HUSKY -Value 0",
+    # every form of assignment
+    "[string[]]$x = git push --force",
+    "${out} = git push --force",
+    "$x[0] = git push --force",
+    "$x, $y = git push --force",
+    "$x ??= git push --force",
+    "$a = $env:HUSKY = 0",
+    # from the review of #36: a group holding a value is that value
+    "git push origin ('--force')",
+    "git push $('--force')",
+    "git push @('--force')",
+    "git push origin ('--force', 'x')",
+    "& ('git') push --force",
+    "Remove-Item -Recurse -Force ('~')",
+    "git push origin ('main')",
+    "pwsh -c ('git push --force')",
+    "$env:HUSKY = (0)",
+    "Set-Item env:HUSKY -Value:0",
 ]
 
 PS_UNPARSEABLE = ["git commit -m 'unbalanced", "git push --force`"]
@@ -336,6 +368,24 @@ PS_ALLOWED = [
     "$branch = git branch --show-current",
     "$out = git push -u origin feat/x 2>&1",
     "if ($x -eq 1) { git status }",
+    # a group used as an argument is one word
+    "Remove-Item -Recurse -Force (Join-Path $env:USERPROFILE '.cache\\pip')",
+    "Remove-Item -Recurse -Force (Join-Path . 'build')",
+    "git commit -m (Get-Content msg.txt -Encoding utf8)",
+    # $(...) runs only in expandable strings
+    "gh pr create --title x --body @'\ndocs: $(git push --force) is now blocked\n'@",
+    "git commit -m 'docs: never run $(git push --force)'",
+    "Write-Output \"a $(git log --format=\"%h (x)\") b\"",
+    # PowerShell's rm parameters aren't rm flags
+    "rm -Force *",
+    "rm * -Force",
+    "rm -Force .",
+    "rm -ErrorAction SilentlyContinue *",
+    # PowerShell has no NAME=value prefix
+    "$x = 'HUSKY=0'",
+    "$line = \"SKIP=lint\"",
+    "Set-Item env:NODE_ENV test",
+    "Set-Content -Path notes.txt -Value env:SKIP",
 ]
 
 
@@ -438,7 +488,8 @@ def test_blocks_commands_too_long_or_slow_to_check(monkeypatch):
     # if the hook times out, Claude Code runs the command
     res = run_guard("git status && " * 10_000)
     assert res.returncode == 2 and b"too long" in res.stderr
-    for cmd, tool in (("cat <<" + "A" * 99_000, "Bash"), ("cat <<A\n" * 12_000, "Bash"), ("@'\n" * 30_000, "PowerShell")):
+    for cmd, tool in (("cat <<" + "A" * 99_000, "Bash"), ("cat <<A\n" * 12_000, "Bash"), ("@'\n" * 30_000, "PowerShell"),
+                      ("si" + " env:A" * 16_000 + "; git push --force", "PowerShell")):
         start = time.monotonic()
         run_guard(cmd, tool)
         assert time.monotonic() - start < 10, cmd[:10]  # no regex that rescans the rest of the command
@@ -447,7 +498,8 @@ def test_blocks_commands_too_long_or_slow_to_check(monkeypatch):
     monkeypatch.setattr(g, "STARTED", time.monotonic())
     assert g.check("git status") is None
     monkeypatch.setattr(g, "STARTED", time.monotonic() - g.TIME_LIMIT - 1)
-    for slow in (lambda: g.check("git status"), g.current_branch, lambda: g.local_branch_exists("x")):
+    for slow in (lambda: g.check("git status"), lambda: g.check("rm x", shell="powershell"), g.current_branch,
+                 lambda: g.local_branch_exists("x")):
         with pytest.raises(TimeoutError):
             slow()
 
